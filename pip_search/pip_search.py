@@ -6,6 +6,8 @@ from dataclasses import InitVar, dataclass
 from datetime import datetime
 from typing import Generator, Union
 from urllib.parse import urljoin
+import string
+import hashlib
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -72,11 +74,53 @@ def search(query: str, opts: Union[dict, Namespace] = {}) -> Generator[Package, 
     if opts.debug: DEBUG = True
     snippets = []
     session = requests.Session()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    }
+    params = {"q": query}
+    r = session.get(config.api_url, params=params, headers=headers)
+
+    # Get script.js url
+    pattern = re.compile(r"/(.*)/script.js")
+    path = pattern.findall(r.text)[0]
+    script_url = f"https://pypi.org/{path}/script.js"
+
+    r = session.get(script_url)
+
+    # Find the PoW data from script.js
+    # TODO: make the pattern more robust
+    pattern = re.compile(
+        r'init\(\[\{"ty":"pow","data":\{"base":"(.+?)","hash":"(.+?)","hmac":"(.+?)","expires":"(.+?)"\}\}\], "(.+?)"'
+    )
+    base, hash, hmac, expires, token = pattern.findall(r.text)[0]
+
+    # Compute the PoW answer
+    answer = ""
+    characters = string.ascii_letters + string.digits
+    for c1 in characters:
+        for c2 in characters:
+            c = base + c1 + c2
+            if hashlib.sha256(c.encode()).hexdigest() == hash:
+                answer = c1 + c2
+                break
+        if answer:
+            break
+
+    # Send the PoW answer
+    back_url = f"https://pypi.org/{path}/fst-post-back"
+    data = {
+        "token": token,
+        "data": [
+            {"ty": "pow", "base": base, "answer": answer, "hmac": hmac, "expires": expires}
+        ],
+    }
+    r = session.post(back_url, json=data)
+
     for page in range(1, config.page_size + 1):
         params = {"q": query, "page": page}
         r = session.get(config.api_url, params=params)
         soup = BeautifulSoup(r.text, "html.parser")
-        snippets += soup.select('a[class*="package- snippet"]')
+        snippets += soup.select('a[class*="package-snippet"]')
         if DEBUG: logger.debug(f'[s] p:{page} snippets={len(snippets)} query={query} ')
     authparam = None
     if opts.extra:
@@ -84,6 +128,7 @@ def search(query: str, opts: Union[dict, Namespace] = {}) -> Generator[Package, 
         GITHUB_USERNAME = os.getenv('GITHUB_USERNAME')
         authparam = HTTPBasicAuth(GITHUB_USERNAME, GITHUBAPITOKEN)
 
+    ## Below codes were moved to [__main__.py]
     # if "sort" in opts:
     #     if opts.sort == "name":
     #         snippets = sorted(snippets,key=lambda s: s.select_one('span[class*="package-snippet__name"]').text.strip())
@@ -96,15 +141,23 @@ def search(query: str, opts: Union[dict, Namespace] = {}) -> Generator[Package, 
     for snippet in snippets:
         link = urljoin(config.api_url, snippet.get("href"))
         package = re.sub(r"\s+", " ", snippet.select_one('span[class*="package-snippet__name"]').text.strip())
-        version = re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__version"]').text.strip())
+
+        #version = re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__version"]').text.strip())
+        # Get version info from https://pypi.org/project/PACKAGE_NAME
+        response = session.get(link)
+        package_page = BeautifulSoup(response.text, "html.parser")
+        version_element = package_page.select_one('h1.package-header__name')
+        version = version_element.text.split()[-1] if version_element else "Unknown"
+
         released = re.sub(r"\s+"," ",snippet.select_one('span[class*="package-snippet__created"]').find("time")["datetime"])
         description = re.sub(r"\s+"," ",snippet.select_one('p[class*="package-snippet__description"]').text.strip())
         pack = Package(package, version, released, description, link)
+        if DEBUG: logger.debug(pack)
         if opts.extra:
             info = get_github_info(link, authparam, session)
             if info:
                 pack.set_gh_info(info)
-                # logger.debug(f'[s] snippet {s} / {len(snippets)} link: {link}')
+                if DEBUG: logger.debug(f'[s] snippet {s} / {len(snippets)} link: {link}')
         yield pack  # Package(package, version, released, description, link, links)
 
 def get_repo_info(repo, auth, session):
@@ -117,7 +170,7 @@ def get_repo_info(repo, auth, session):
         return info
     apiurl = f'https://api.github.com/repos/{reponame}'
     r = session.get(apiurl, auth=auth)
-    # logger.info(f'[r] repo:{repo} apiurl: {apiurl} r={r.status_code}')
+    if DEBUG: logger.info(f'[r] repo:{repo} apiurl: {apiurl} r={r.status_code}')
     if r.status_code == 401:
         if DEBUG:
             logger.error(f'[r] autherr:401 repo: {repo} apiurl: {apiurl} a:{auth}')
